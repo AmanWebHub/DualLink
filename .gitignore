@@ -1,0 +1,31 @@
+# Rust build output
+/target/
+
+# Rust backup / temporary files
+**/*.rs.bk
+*.rs.bk
+
+# Logs and crash dumps
+*.log
+*.dmp
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Editor and IDE settings
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local screenshots / temporary exports
+/screenshot.png
+/screenshots/
