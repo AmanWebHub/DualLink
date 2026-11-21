@@ -1,8 +1,11 @@
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use gilrs::{Axis, Button as PadButton, EventType, GamepadId, Gilrs};
+use hidapi::HidApi;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
+use std::thread;
 use std::time::Duration;
 use vigem_client::{Client, TargetId, XButtons, XGamepad, Xbox360Wired};
 
@@ -31,7 +34,8 @@ struct ControllerApp {
     right_y: f32,
     trigger_left: f32,
     trigger_right: f32,
-    pressed: [bool; 16],
+    pressed: [bool; 18],
+    touchpad_pressed: Arc<AtomicBool>,
     notice: String,
     gilrs: Option<Gilrs>,
     input_error: Option<String>,
@@ -71,6 +75,7 @@ impl ControllerApp {
             profile.bindings = migrate_profile_bindings(std::mem::take(&mut profile.bindings));
         }
         let bindings = profiles[0].bindings.clone();
+        let touchpad_pressed = start_ds4_touchpad_reader();
         let (gilrs, input_error) = match Gilrs::new() {
             Ok(gilrs) => (Some(gilrs), None),
             Err(error) => (
@@ -89,7 +94,8 @@ impl ControllerApp {
             right_y: 0.0,
             trigger_left: 0.0,
             trigger_right: 0.0,
-            pressed: [false; 16],
+            pressed: [false; 18],
+            touchpad_pressed,
             notice,
             gilrs,
             input_error,
@@ -140,6 +146,7 @@ impl ControllerApp {
         };
         self.profiles.push(profile);
         self.set_profile(self.profiles.len() - 1);
+        self.save_profiles();
     }
 
     fn draw_sidebar(&mut self, ctx: &egui::Context) {
@@ -319,7 +326,7 @@ impl ControllerApp {
             metric_card(
                 &mut columns[1],
                 "BUTTONS MAPPED",
-                &format!("{} / 14", self.bindings.len()),
+                &format!("{} / 18", self.bindings.len()),
                 "Customizable controls",
                 GREEN,
             );
@@ -442,10 +449,12 @@ impl ControllerApp {
                 "Cross (bottom face)", "Circle (right face)", "Square (left face)", "Triangle (top face)",
                 "L1 (left bumper)", "R1 (right bumper)", "L2 (left trigger)", "R2 (right trigger)",
                 "Options", "Share", "L3 (left stick click)", "R3 (right stick click)",
+                "PS button", "Touchpad click",
             ];
             ui.columns(2, |columns| {
                 for (column_index, column) in columns.iter_mut().enumerate() {
-                    for index in (column_index * 8)..(column_index * 8 + 8) {
+                    let range = if column_index == 0 { 0..9 } else { 9..18 };
+                    for index in range {
                         mapping_row(column, index, actions[index], self.bindings.get_mut(index));
                     }
                 }
@@ -453,7 +462,7 @@ impl ControllerApp {
             ui.add_space(8.0);
             ui.label(
                 egui::RichText::new(
-                    "These profile mappings are sent to the virtual Xbox controller when output is enabled.",
+                    "These profile mappings are sent to the virtual Xbox controller when output is enabled. DualShock 4 touchpad clicks are read separately from the PS button using the controller USB HID report.",
                 )
                 .size(11.0)
                 .color(MUTED),
@@ -543,6 +552,7 @@ impl ControllerApp {
                     });
                 });
                 ui.add_space(14.0);
+                let mut delete_profile = None;
                 for index in 0..self.profiles.len() {
                     let name = self.profiles[index].name.clone();
                     let selected = self.selected_profile == index;
@@ -583,11 +593,25 @@ impl ControllerApp {
                                     } else if ui.button("Use profile").clicked() {
                                         self.set_profile(index);
                                     }
+                                    if self.profiles.len() > 1 && ui.small_button("Delete").clicked() {
+                                        delete_profile = Some(index);
+                                    }
                                 },
                             );
                         });
                     });
                     ui.add_space(8.0);
+                }
+                if let Some(index) = delete_profile {
+                    self.profiles.remove(index);
+                    if self.selected_profile > index {
+                        self.selected_profile -= 1;
+                    } else if self.selected_profile == index {
+                        self.selected_profile = index.min(self.profiles.len() - 1);
+                    }
+                    self.bindings = self.profiles[self.selected_profile].bindings.clone();
+                    self.save_profiles();
+                    self.notice = "Profile deleted".into();
                 }
                 ui.add_space(8.0);
                 ui.label(
@@ -599,12 +623,22 @@ impl ControllerApp {
             card(&mut columns[1], |ui| {
                 section_heading(ui, "Selected layout", "Edit bindings in Button mapping");
                 ui.add_space(14.0);
-                ui.label(
-                    egui::RichText::new(self.profile_name())
-                        .size(20.0)
-                        .strong()
-                        .color(INK),
-                );
+                let selected_index = self.selected_profile;
+                ui.label(egui::RichText::new("Profile name").size(11.0).strong().color(MUTED));
+                ui.add(egui::TextEdit::singleline(&mut self.profiles[selected_index].name)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("Enter a profile name"));
+                ui.add_space(5.0);
+                if ui.button("Save profile name").clicked() {
+                    let cleaned = self.profiles[selected_index].name.trim().to_owned();
+                    if cleaned.is_empty() {
+                        self.profiles[selected_index].name = "My profile".into();
+                    } else {
+                        self.profiles[selected_index].name = cleaned;
+                    }
+                    self.save_profiles();
+                    self.notice = "Profile name saved".into();
+                }
                 ui.add_space(5.0);
                 ui.label(
                     egui::RichText::new(format!("{} controls configured", self.bindings.len()))
@@ -632,6 +666,7 @@ impl ControllerApp {
     }
 
     fn poll_controller(&mut self) {
+        let touchpad_pressed = self.touchpad_pressed.load(Ordering::Relaxed);
         let Some(gilrs) = self.gilrs.as_mut() else {
             return;
         };
@@ -683,8 +718,15 @@ impl ControllerApp {
                 PadButton::Select,
                 PadButton::LeftThumb,
                 PadButton::RightThumb,
+                PadButton::Mode, // The PS / Guide button, not the touchpad click.
             ];
-            let pressed = sources.map(|source| gamepad.is_pressed(source));
+            let mut pressed = [false; 18];
+            for (index, source) in sources.into_iter().enumerate() {
+                pressed[index] = gamepad.is_pressed(source);
+            }
+            // The touchpad click is not reliably exposed by gilrs on Windows.
+            // It is read independently from the Sony DualShock 4 USB HID report.
+            pressed[17] = touchpad_pressed;
             let mut state =
                 translate_controls(pressed, trigger_left, trigger_right, &self.bindings);
             state.thumb_lx = (left_x * i16::MAX as f32) as i16;
@@ -730,7 +772,7 @@ impl ControllerApp {
             self.right_y = 0.0;
             self.trigger_left = 0.0;
             self.trigger_right = 0.0;
-            self.pressed = [false; 16];
+            self.pressed = [false; 18];
             if let Some(virtual_gamepad) = self.virtual_gamepad.as_mut() {
                 if let Err(error) = virtual_gamepad.update(&XGamepad::default()) {
                     self.notice = format!("Virtual controller update failed: {error}");
@@ -880,7 +922,7 @@ impl ControllerApp {
                 ui.add_space(18.0);
                 section_heading(ui, "Standard button translation", "Your saved mapping profile selects the Xbox buttons");
                 ui.add_space(8.0);
-                ui.label(egui::RichText::new("Sticks and analog triggers pass through; face buttons, D-pad, bumpers, menu buttons, and stick clicks are translated using the active profile.").size(11.5).color(MUTED));
+                ui.label(egui::RichText::new("Sticks and analog triggers pass through; face buttons, D-pad, bumpers, menu buttons, stick clicks, the PS button, and the separately detected touchpad click use the active profile.").size(11.5).color(MUTED));
                 ui.add_space(8.0);
                 ui.label(egui::RichText::new("This creates an Xbox 360-style XInput controller. Some very old DirectInput-only games may not accept it; check the game's controller settings. If the game sees both controllers, adjust its controller settings; this app needs the PS4 controller to stay connected.").size(11.0).color(MUTED));
                 ui.add_space(11.0);
@@ -999,6 +1041,83 @@ impl eframe::App for ControllerApp {
     }
 }
 
+/// Extracts the touchpad-click state from a standard 64-byte DS4 USB input report.
+/// Returns None for short or non-USB reports.
+fn ds4_touchpad_click_from_usb_report(report: &[u8]) -> Option<bool> {
+    if report.len() >= 8 && report[0] == 0x01 {
+        Some(report[7] & 0x02 != 0)
+    } else {
+        None
+    }
+}
+
+/// Reads the DualShock 4 V2 touchpad-click bit directly from its USB HID input report.
+///
+/// Sony's DS4 USB report is 64 bytes (report ID 0x01). The three button bytes
+/// begin at offsets 5..=7; bit 1 of the third button byte (offset 7) is the
+/// touchpad click. The PS button remains independently available through gilrs::Mode.
+fn start_ds4_touchpad_reader() -> Arc<AtomicBool> {
+    const SONY_VENDOR_ID: u16 = 0x054C;
+    const DUALSHOCK4_V2_PRODUCT_ID: u16 = 0x09CC;
+
+    let pressed = Arc::new(AtomicBool::new(false));
+    let thread_state = Arc::clone(&pressed);
+
+    thread::spawn(move || {
+        let mut api = match HidApi::new() {
+            Ok(api) => api,
+            Err(error) => {
+                eprintln!("Could not initialize HID access for the DS4 touchpad: {error}");
+                return;
+            }
+        };
+
+        let mut device = None;
+
+        loop {
+            if device.is_none() {
+                let _ = api.refresh_devices();
+                device = api
+                    .device_list()
+                    .find(|info| {
+                        info.vendor_id() == SONY_VENDOR_ID
+                            && info.product_id() == DUALSHOCK4_V2_PRODUCT_ID
+                    })
+                    .and_then(|info| info.open_device(&api).ok());
+
+                if device.is_none() {
+                    thread_state.store(false, Ordering::Relaxed);
+                    thread::sleep(Duration::from_millis(250));
+                    continue;
+                }
+            }
+
+            let mut report = [0u8; 64];
+            let read_result = device
+                .as_ref()
+                .expect("HID device was just checked")
+                .read_timeout(&mut report, 30);
+
+            match read_result {
+                Ok(_) => {
+                    if let Some(is_pressed) = ds4_touchpad_click_from_usb_report(&report) {
+                        thread_state.store(is_pressed, Ordering::Relaxed);
+                    }
+                    // Ignore short or unrelated HID reports; don't invent a press.
+                }
+                Err(error) => {
+                    eprintln!("DualShock 4 touchpad HID read stopped: {error}");
+                    device = None;
+                    thread_state.store(false, Ordering::Relaxed);
+                    thread::sleep(Duration::from_millis(250));
+                }
+            }
+        }
+    });
+
+    pressed
+}
+
 /// Reads an analog trigger. Most Windows backends report L2/R2 as an analog
 /// *button* (not an axis), so check that first, then the Z axis, and finally
 /// fall back to the digital pressed state so the trigger never reads as 0.
@@ -1063,7 +1182,7 @@ fn mapped_button(binding: &str) -> u16 {
 }
 
 fn translate_controls(
-    pressed: [bool; 16],
+    pressed: [bool; 18],
     left_trigger: f32,
     right_trigger: f32,
     bindings: &[String],
@@ -1149,8 +1268,19 @@ fn migrate_profile_bindings(old: Vec<String>) -> Vec<String> {
         return migrated;
     }
 
+    let old_len = old.len();
     let mut bindings: Vec<String> = old.iter().map(|value| canonical_target(value)).collect();
     let defaults = default_bindings();
+
+    // In the previous 17-control layout, index 16 was incorrectly labelled as
+    // the touchpad even though gilrs::Mode actually reports the PS button.
+    // Preserve any saved mapping at index 16 as the new touchpad mapping.
+    if old_len == 17 {
+        let previous_touchpad_binding = bindings[16].clone();
+        bindings[16] = "Unmapped".into(); // New independent PS-button slot.
+        bindings.push(previous_touchpad_binding);
+    }
+
     bindings.resize_with(defaults.len(), String::new);
     for (index, binding) in bindings.iter_mut().enumerate() {
         if binding.is_empty() {
@@ -1178,6 +1308,8 @@ fn default_bindings() -> Vec<String> {
         "Xbox View",
         "Left Stick Click",
         "Right Stick Click",
+        "Unmapped", // PS button
+        "Unmapped", // Touchpad click
     ]
     .into_iter()
     .map(str::to_owned)
@@ -1345,8 +1477,8 @@ struct PadView {
     trigger_right: f32,
     /// Same order as the `sources` list in `poll_controller`:
     /// 0-3 D-pad up/down/left/right, 4 Cross, 5 Circle, 6 Square, 7 Triangle,
-    /// 8 L1, 9 R1, 10 L2, 11 R2, 12 Options, 13 Share, 14 L3, 15 R3.
-    pressed: [bool; 16],
+    /// 8 L1, 9 R1, 10 L2, 11 R2, 12 Options, 13 Share, 14 L3, 15 R3, 16 PS button, 17 touchpad click.
+    pressed: [bool; 18],
 }
 
 /// Splits a (possibly concave) polygon into triangles by ear clipping.
@@ -1521,7 +1653,7 @@ fn draw_controller(ui: &mut egui::Ui, view: &PadView) {
     let pad = Rect::from_min_max(p(160.0, 106.0), p(240.0, 146.0));
     let pad_radius = egui::CornerRadius::same((10.0 * scale) as u8);
     painter.rect_filled(pad.expand(1.5), pad_radius, outline);
-    painter.rect_filled(pad, pad_radius, shell_light);
+    painter.rect_filled(pad, pad_radius, if view.pressed[17] { lit } else { shell_light });
 
     // Share (left) and Options (right).
     for (x, down) in [(144.0_f32, view.pressed[13]), (256.0_f32, view.pressed[12])] {
@@ -1597,7 +1729,7 @@ fn draw_controller(ui: &mut egui::Ui, view: &PadView) {
 
     // PS button.
     painter.circle_filled(p(200.0, 168.0), 8.0 * scale, outline);
-    painter.circle_filled(p(200.0, 168.0), 6.5 * scale, idle);
+    painter.circle_filled(p(200.0, 168.0), 6.5 * scale, if view.pressed[16] { lit } else { idle });
 
     // Analog sticks move live; the ring lights up on L3/R3 click.
     for (center, x, y, down) in [
@@ -1807,6 +1939,7 @@ fn draw_controller_map(ui: &mut egui::Ui, view: &PadView, bindings: &[String]) {
         Stroke::new(2.0 * scale, Color32::from_rgb(70, 100, 220)),
     );
     let pad = Rect::from_min_max(c(160.0, 106.0), c(240.0, 146.0));
+    painter.rect_filled(pad, egui::CornerRadius::same((10.0 * scale) as u8), if view.pressed[17] { lit } else { well });
     painter.rect_stroke(pad, egui::CornerRadius::same((10.0 * scale) as u8), thin, egui::StrokeKind::Inside);
     for row in 0..8 {
         for col in 0..17 {
@@ -1868,6 +2001,7 @@ fn draw_controller_map(ui: &mut egui::Ui, view: &PadView, bindings: &[String]) {
     }
 
     // PS button and speaker dots.
+    painter.circle_filled(c(200.0, 168.0), 6.5 * u, if view.pressed[16] { lit } else { well });
     painter.circle_stroke(c(200.0, 168.0), 7.5 * u, thin);
     for row in 0..2 {
         for col in 0..3 {
@@ -2039,8 +2173,20 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{mapped_button, migrate_profile_bindings, translate_controls, trigger_value};
+    use super::{ds4_touchpad_click_from_usb_report, mapped_button, migrate_profile_bindings, translate_controls, trigger_value};
     use vigem_client::{XButtons, XGamepad};
+
+    #[test]
+    fn ds4_usb_touchpad_click_is_read_from_its_own_hid_bit() {
+        let mut report = [0u8; 64];
+        report[0] = 0x01;
+        report[7] = 0x02;
+        assert_eq!(ds4_touchpad_click_from_usb_report(&report), Some(true));
+
+        report[7] = 0x00;
+        assert_eq!(ds4_touchpad_click_from_usb_report(&report), Some(false));
+        assert_eq!(ds4_touchpad_click_from_usb_report(&report[..7]), None);
+    }
 
     #[test]
     fn modern_face_buttons_map_to_xbox_layout() {
@@ -2052,7 +2198,7 @@ mod tests {
 
     #[test]
     fn analog_triggers_map_independently_and_retain_pressure() {
-        let mut pressed = [false; 16];
+        let mut pressed = [false; 18];
         pressed[10] = true;
         let bindings = super::default_bindings();
         let state = translate_controls(pressed, 0.42, 0.0, &bindings);
@@ -2068,7 +2214,7 @@ mod tests {
 
     #[test]
     fn options_and_share_map_to_modern_menu_and_view_buttons() {
-        let mut pressed = [false; 16];
+        let mut pressed = [false; 18];
         pressed[12] = true;
         pressed[13] = true;
         let state = translate_controls(pressed, 0.0, 0.0, &super::default_bindings());
@@ -2079,7 +2225,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_saved_layouts_migrate_to_the_new_sixteen_control_layout() {
+    fn legacy_saved_layouts_migrate_to_the_eighteen_control_layout() {
         let legacy = vec![
             "D-pad Up",
             "D-pad Down",
@@ -2100,7 +2246,7 @@ mod tests {
         .map(str::to_owned)
         .collect();
         let migrated = migrate_profile_bindings(legacy);
-        assert_eq!(migrated.len(), 16);
+        assert_eq!(migrated.len(), 18);
         assert_eq!(migrated[4], "Xbox A");
         assert_eq!(migrated[10], "Left Trigger");
         assert_eq!(migrated[11], "Right Trigger");
@@ -2117,7 +2263,7 @@ mod tests {
 
     #[test]
     fn unmapped_controls_produce_neutral_output() {
-        let state = translate_controls([true; 16], 1.0, 1.0, &vec!["Unmapped".into(); 16]);
+        let state = translate_controls([true; 18], 1.0, 1.0, &vec!["Unmapped".into(); 18]);
         assert_eq!(state, XGamepad::default());
     }
 }
