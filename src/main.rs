@@ -1,3 +1,4 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use gilrs::{Axis, Button as PadButton, EventType, GamepadId, Gilrs};
@@ -1041,14 +1042,17 @@ impl eframe::App for ControllerApp {
     }
 }
 
-/// Extracts the touchpad-click state from a standard 64-byte DS4 USB input report.
-/// Returns None for short or non-USB reports.
-fn ds4_touchpad_click_from_usb_report(report: &[u8]) -> Option<bool> {
-    if report.len() >= 8 && report[0] == 0x01 {
-        Some(report[7] & 0x02 != 0)
-    } else {
-        None
-    }
+/// Extracts the touchpad-click state from a DualShock 4 input report.
+/// USB (and the simple Bluetooth mode) use report 0x01 with the three button bytes at 5..=7;
+/// the full Bluetooth report 0x11 carries the same bytes two positions later (7..=9).
+/// Returns None for anything else, such as an empty read or an unrelated report.
+fn ds4_touchpad_click_from_report(report: &[u8]) -> Option<bool> {
+    let button_byte = match report.first() {
+        Some(0x01) if report.len() >= 8 => report[7],
+        Some(0x11) if report.len() >= 10 => report[9],
+        _ => return None,
+    };
+    Some(button_byte & 0x02 != 0)
 }
 
 /// Reads the DualShock 4 V2 touchpad-click bit directly from its USB HID input report.
@@ -1058,7 +1062,8 @@ fn ds4_touchpad_click_from_usb_report(report: &[u8]) -> Option<bool> {
 /// touchpad click. The PS button remains independently available through gilrs::Mode.
 fn start_ds4_touchpad_reader() -> Arc<AtomicBool> {
     const SONY_VENDOR_ID: u16 = 0x054C;
-    const DUALSHOCK4_V2_PRODUCT_ID: u16 = 0x09CC;
+    // DualShock 4 v1, DualShock 4 v2, and Sony's USB wireless adapter.
+    const DUALSHOCK4_PRODUCT_IDS: [u16; 3] = [0x05C4, 0x09CC, 0x0BA0];
 
     let pressed = Arc::new(AtomicBool::new(false));
     let thread_state = Arc::clone(&pressed);
@@ -1081,7 +1086,7 @@ fn start_ds4_touchpad_reader() -> Arc<AtomicBool> {
                     .device_list()
                     .find(|info| {
                         info.vendor_id() == SONY_VENDOR_ID
-                            && info.product_id() == DUALSHOCK4_V2_PRODUCT_ID
+                            && DUALSHOCK4_PRODUCT_IDS.contains(&info.product_id())
                     })
                     .and_then(|info| info.open_device(&api).ok());
 
@@ -1092,15 +1097,15 @@ fn start_ds4_touchpad_reader() -> Arc<AtomicBool> {
                 }
             }
 
-            let mut report = [0u8; 64];
+            let mut report = [0u8; 96];
             let read_result = device
                 .as_ref()
                 .expect("HID device was just checked")
                 .read_timeout(&mut report, 30);
 
             match read_result {
-                Ok(_) => {
-                    if let Some(is_pressed) = ds4_touchpad_click_from_usb_report(&report) {
+                Ok(read) => {
+                    if let Some(is_pressed) = ds4_touchpad_click_from_report(&report[..read]) {
                         thread_state.store(is_pressed, Ordering::Relaxed);
                     }
                     // Ignore short or unrelated HID reports; don't invent a press.
@@ -1856,14 +1861,14 @@ fn callout_row(
 fn draw_controller_map(ui: &mut egui::Ui, view: &PadView, bindings: &[String]) {
     let width = ui.available_width().max(520.0);
     let scale = (width / 860.0).min(1.25);
-    let (area, _) = ui.allocate_exact_size(Vec2::new(width, 392.0 * scale), Sense::hover());
+    let (area, _) = ui.allocate_exact_size(Vec2::new(width, 440.0 * scale), Sense::hover());
     let painter = ui.painter_at(area);
     painter.rect_filled(area, egui::CornerRadius::same(12), Color32::from_rgb(13, 16, 22));
 
     let origin = Pos2::new(area.center().x - 430.0 * scale, area.top());
     let p = |x: f32, y: f32| origin + Vec2::new(x, y) * scale;
     // Controller space (the 400-wide design used by the compact preview) -> diagram space.
-    let c = |x: f32, y: f32| p(430.0 + (x - 200.0) * 1.25, 60.0 + (y - 66.0) * 1.25);
+    let c = |x: f32, y: f32| p(430.0 + (x - 200.0) * 1.25, 86.0 + (y - 66.0) * 1.25);
     let u = scale * 1.25;
 
     let line = Color32::from_rgb(214, 221, 233);
@@ -2034,7 +2039,7 @@ fn draw_controller_map(ui: &mut egui::Ui, view: &PadView, bindings: &[String]) {
     let inset = 6.0 * scale;
 
     // L2 / R2: elbow lines from above.
-    let row_y = p(0.0, 48.0).y;
+    let row_y = p(0.0, 74.0).y;
     let l2 = c(118.0, 70.0);
     painter.add(egui::Shape::line(vec![Pos2::new(left_edge + inset, row_y), Pos2::new(l2.x, row_y), l2], leader));
     dot(l2);
@@ -2054,13 +2059,26 @@ fn draw_controller_map(ui: &mut egui::Ui, view: &PadView, bindings: &[String]) {
     dot(r1);
     callout_row(&painter, right_edge, r1.y, 1, Pill::Text("R1"), &value(9), tint(9), scale);
 
-    // Share / Options: labels above, lines straight down.
-    for (x, index, name) in [(144.0_f32, 13_usize, "SHARE"), (256.0_f32, 12_usize, "OPTIONS")] {
+    // Touchpad click: label at the top centre with a line straight down to the pad.
+    let pad_top = c(200.0, 106.0);
+    let touch_y = p(0.0, 16.0).y;
+    painter.add(egui::Shape::line(
+        vec![Pos2::new(pad_top.x, touch_y + 12.0 * scale), pad_top],
+        leader,
+    ));
+    dot(pad_top);
+    callout_row(&painter, pad_top.x, touch_y, 0, Pill::Text("TOUCHPAD"), &value(17), tint(17), scale);
+
+    // Share / Options: labels sit a little outward so they clear the touchpad line.
+    for (x, index, name, shift) in [
+        (144.0_f32, 13_usize, "SHARE", -22.0_f32),
+        (256.0_f32, 12_usize, "OPTIONS", 22.0_f32),
+    ] {
         let at = c(x, 104.0);
-        let y = p(0.0, 20.0).y;
+        let y = p(0.0, 46.0).y;
         painter.add(egui::Shape::line(vec![Pos2::new(at.x, y + 12.0 * scale), at], leader));
         dot(at);
-        callout_row(&painter, at.x, y, 0, Pill::Text(name), &value(index), tint(index), scale);
+        callout_row(&painter, at.x + shift * scale, y, 0, Pill::Text(name), &value(index), tint(index), scale);
     }
 
     // D-pad bracket on the left.
@@ -2115,7 +2133,7 @@ fn draw_controller_map(ui: &mut egui::Ui, view: &PadView, bindings: &[String]) {
     }
 
     // Sticks: lines run down and out to labels at the bottom.
-    let line_y = p(0.0, 345.0).y;
+    let line_y = p(0.0, 371.0).y;
     let left_stick = sticks[0].0;
     let right_stick = sticks[1].0;
     let left_bottom = Pos2::new(left_stick.x, left_stick.y + 22.0 * u);
@@ -2134,6 +2152,14 @@ fn draw_controller_map(ui: &mut egui::Ui, view: &PadView, bindings: &[String]) {
     dot(right_bottom);
     callout_row(&painter, right_edge, line_y - 15.0 * scale, 1, Pill::Text("R"), "Right stick", dim, scale);
     callout_row(&painter, right_edge, line_y + 15.0 * scale, 1, Pill::Text("R3"), &value(15), tint(15), scale);
+
+    // PS button: label at the bottom centre, line straight down from the button.
+    let ps = c(200.0, 168.0);
+    let ps_edge = Pos2::new(ps.x, ps.y + 7.5 * u);
+    let ps_y = p(0.0, 412.0).y;
+    painter.add(egui::Shape::line(vec![ps_edge, Pos2::new(ps.x, ps_y - 12.0 * scale)], leader));
+    dot(ps_edge);
+    callout_row(&painter, ps.x, ps_y, 0, Pill::Text("PS"), &value(16), tint(16), scale);
 }
 
 fn main() -> eframe::Result<()> {
@@ -2173,7 +2199,7 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ds4_touchpad_click_from_usb_report, mapped_button, migrate_profile_bindings, translate_controls, trigger_value};
+    use super::{ds4_touchpad_click_from_report, mapped_button, migrate_profile_bindings, translate_controls, trigger_value};
     use vigem_client::{XButtons, XGamepad};
 
     #[test]
@@ -2181,11 +2207,28 @@ mod tests {
         let mut report = [0u8; 64];
         report[0] = 0x01;
         report[7] = 0x02;
-        assert_eq!(ds4_touchpad_click_from_usb_report(&report), Some(true));
+        assert_eq!(ds4_touchpad_click_from_report(&report), Some(true));
 
         report[7] = 0x00;
-        assert_eq!(ds4_touchpad_click_from_usb_report(&report), Some(false));
-        assert_eq!(ds4_touchpad_click_from_usb_report(&report[..7]), None);
+        assert_eq!(ds4_touchpad_click_from_report(&report), Some(false));
+        assert_eq!(ds4_touchpad_click_from_report(&report[..7]), None);
+        // the PS button (bit 0) must not count as a touchpad click
+        report[7] = 0x01;
+        assert_eq!(ds4_touchpad_click_from_report(&report), Some(false));
+    }
+
+    #[test]
+    fn ds4_bluetooth_touchpad_click_is_read_from_report_0x11() {
+        let mut report = [0u8; 78];
+        report[0] = 0x11;
+        report[9] = 0x02;
+        assert_eq!(ds4_touchpad_click_from_report(&report), Some(true));
+        report[9] = 0x00;
+        assert_eq!(ds4_touchpad_click_from_report(&report), Some(false));
+        assert_eq!(ds4_touchpad_click_from_report(&report[..9]), None);
+        // empty reads (timeouts) and unrelated reports never invent a press
+        assert_eq!(ds4_touchpad_click_from_report(&[]), None);
+        assert_eq!(ds4_touchpad_click_from_report(&[0x05, 0, 0, 0, 0, 0, 0, 0, 0, 0x02]), None);
     }
 
     #[test]
