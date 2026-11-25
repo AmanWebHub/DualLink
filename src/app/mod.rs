@@ -14,6 +14,7 @@ use crate::theme::*;
 
 mod pages;
 mod sidebar;
+mod game_prompts;
 
 /// In-progress rename of one profile on the Profiles page.
 struct RenameState {
@@ -62,6 +63,7 @@ pub(crate) struct ControllerApp {
     screenshot_path: Option<PathBuf>,
     screenshot_requested: bool,
     screenshot_frames: u32,
+    game_prompts: game_prompts::GamePromptManager,
 }
 
 impl ControllerApp {
@@ -128,6 +130,7 @@ impl ControllerApp {
             screenshot_path,
             screenshot_requested: false,
             screenshot_frames: 0,
+            game_prompts: game_prompts::GamePromptManager::default(),
         }
     }
 
@@ -440,6 +443,7 @@ impl ControllerApp {
                         "Profiles" => self.draw_profiles(ui),
                         "Compatibility" => self.draw_compatibility(ui),
                         "How to use" => self.draw_help(ui),
+                        "Game prompts" => self.game_prompts.show(ui),
                         _ => self.draw_overview(ui),
                     });
             });
@@ -536,6 +540,7 @@ fn page_title(page: &str) -> &str {
         "Profiles" => "Your profiles",
         "Compatibility" => "PlayStation controller support",
         "How to use" => "How to use DualLink",
+        "Game prompts" => "Game prompts",
         _ => "Controller setup",
     }
 }
@@ -549,6 +554,7 @@ fn page_subtitle(page: &str) -> &str {
         "How to use" => {
             "Simple setup steps, profile tips, and things to check if a game ignores input."
         }
+        "Game prompts" => "Install and restore game-specific PlayStation button prompt mods.",
         _ => "A simple home for your controller layout.",
     }
 }

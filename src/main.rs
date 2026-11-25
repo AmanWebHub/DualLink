@@ -1,4 +1,3 @@
-
 mod app;
 mod hid;
 mod mapping;
@@ -45,7 +44,6 @@ fn main() -> eframe::Result<()> {
     }
 
     let screenshot_mode = screenshot_path.is_some();
-
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1440.0, 900.0])
         .with_min_inner_size([1050.0, 680.0])
@@ -53,26 +51,20 @@ fn main() -> eframe::Result<()> {
 
     if screenshot_mode {
         viewport = viewport.with_active(false);
-
         #[cfg(target_os = "windows")]
         {
-            viewport = viewport.with_window_level(
-                egui::viewport::WindowLevel::AlwaysOnBottom,
-            );
+            viewport = viewport.with_window_level(egui::viewport::WindowLevel::AlwaysOnBottom);
         }
     }
-
     let options = eframe::NativeOptions {
         viewport,
         ..Default::default()
     };
-
     eframe::run_native(
         "DualLink Controller Studio",
         options,
         Box::new(move |creation_context| {
             apply_style(&creation_context.egui_ctx);
-
             Ok(Box::new(ControllerApp::new(screenshot_path)))
         }),
     )
