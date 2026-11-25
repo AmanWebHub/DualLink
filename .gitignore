@@ -1,6 +1,7 @@
 # Rust build output
 /target/
 
+
 # Rust backup / temporary files
 **/*.rs.bk
 *.rs.bk
@@ -29,3 +30,5 @@ Desktop.ini
 # Local screenshots / temporary exports
 /screenshot.png
 /screenshots/
+*.rar
+*.zip
