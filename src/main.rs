@@ -1,4 +1,3 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use gilrs::{Axis, Button as PadButton, EventType, GamepadId, Gilrs};
@@ -17,6 +16,99 @@ const INK: Color32 = Color32::from_rgb(35, 48, 69);
 const MUTED: Color32 = Color32::from_rgb(124, 137, 157);
 const GREEN: Color32 = Color32::from_rgb(40, 166, 119);
 const LINE: Color32 = Color32::from_rgb(231, 235, 241);
+const RED: Color32 = Color32::from_rgb(214, 69, 69);
+const SIDEBAR_MUTED: Color32 = Color32::from_rgb(143, 162, 193);
+const DRIVER_URL: &str = "https://github.com/nefarius/ViGEmBus/releases";
+
+/// In-progress rename of one profile on the Profiles page.
+struct RenameState {
+    index: usize,
+    text: String,
+    focus: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ProfileAction {
+    Use(usize),
+    StartRename(usize),
+    CommitRename,
+    CancelRename,
+    AskDelete(usize),
+    ConfirmDelete(usize),
+    CancelDelete,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Settings {
+    /// Turn Xbox output on by itself whenever a controller is connected.
+    #[serde(default = "default_true")]
+    auto_enable: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self { auto_enable: true }
+    }
+}
+
+fn settings_path() -> Result<PathBuf, String> {
+    profiles_path().map(|path| path.with_file_name("settings.json"))
+}
+
+fn load_settings() -> Settings {
+    settings_path()
+        .ok()
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn save_settings(settings: &Settings) -> Result<(), String> {
+    let path = settings_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let json = serde_json::to_vec_pretty(settings).map_err(|error| error.to_string())?;
+    std::fs::write(path, json).map_err(|error| error.to_string())
+}
+
+/// Whether Xbox output should start by itself right now.
+fn should_auto_enable(
+    auto_enable: bool,
+    controller_connected: bool,
+    already_attempted: bool,
+    turned_off_by_user: bool,
+    output_active: bool,
+) -> bool {
+    auto_enable && controller_connected && !already_attempted && !turned_off_by_user && !output_active
+}
+
+fn unique_profile_name(profiles: &[Profile]) -> String {
+    let mut number = profiles.len() + 1;
+    loop {
+        let candidate = format!("My profile {number}");
+        let lowered = candidate.to_lowercase();
+        if !profiles.iter().any(|profile| profile.name.to_lowercase() == lowered) {
+            return candidate;
+        }
+        number += 1;
+    }
+}
+
+/// Which profile should be selected after `deleted` is removed (`new_len` is the length afterwards).
+fn selection_after_delete(selected: usize, deleted: usize, new_len: usize) -> usize {
+    if deleted < selected {
+        selected - 1
+    } else if deleted == selected {
+        deleted.min(new_len.saturating_sub(1))
+    } else {
+        selected
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Profile {
@@ -37,6 +129,12 @@ struct ControllerApp {
     trigger_right: f32,
     pressed: [bool; 18],
     touchpad_pressed: Arc<AtomicBool>,
+    auto_enable: bool,
+    auto_attempted: bool,
+    user_turned_off: bool,
+    output_error: Option<String>,
+    renaming: Option<RenameState>,
+    confirm_delete: Option<usize>,
     notice: String,
     gilrs: Option<Gilrs>,
     input_error: Option<String>,
@@ -97,6 +195,12 @@ impl ControllerApp {
             trigger_right: 0.0,
             pressed: [false; 18],
             touchpad_pressed,
+            auto_enable: load_settings().auto_enable,
+            auto_attempted: false,
+            user_turned_off: false,
+            output_error: None,
+            renaming: None,
+            confirm_delete: None,
             notice,
             gilrs,
             input_error,
@@ -113,24 +217,27 @@ impl ControllerApp {
     fn set_profile(&mut self, index: usize) {
         if let Some(profile) = self.profiles.get(index) {
             self.selected_profile = index;
+            self.renaming = None;
+            self.confirm_delete = None;
             self.bindings = profile.bindings.clone();
             self.notice = format!("{} profile selected", profile.name);
         }
+    }
+
+    fn write_profiles(&self) -> Result<(), String> {
+        let path = profiles_path()?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        let json = serde_json::to_vec_pretty(&self.profiles).map_err(|error| error.to_string())?;
+        std::fs::write(path, json).map_err(|error| error.to_string())
     }
 
     fn save_profiles(&mut self) {
         if let Some(profile) = self.profiles.get_mut(self.selected_profile) {
             profile.bindings = self.bindings.clone();
         }
-        let result = profiles_path().and_then(|path| {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-            }
-            let json =
-                serde_json::to_vec_pretty(&self.profiles).map_err(|error| error.to_string())?;
-            std::fs::write(path, json).map_err(|error| error.to_string())
-        });
-        match result {
+        match self.write_profiles() {
             Ok(()) => self.notice = "Profiles saved on this computer".into(),
             Err(error) => {
                 eprintln!("Could not save controller profiles: {error}");
@@ -139,20 +246,81 @@ impl ControllerApp {
         }
     }
 
+    /// Saves the list of profiles right away after a rename, delete or new profile.
+    /// Unsaved edits to the current layout are not written; use Save profile for those.
+    fn persist_profiles(&mut self, message: String) {
+        match self.write_profiles() {
+            Ok(()) => self.notice = message,
+            Err(error) => {
+                eprintln!("Could not save controller profiles: {error}");
+                self.notice = format!("{message}, but it could not be saved: {error}");
+            }
+        }
+    }
+
     fn add_profile(&mut self) {
-        let number = self.profiles.len() + 1;
-        let profile = Profile {
-            name: format!("My profile {number}"),
+        let name = unique_profile_name(&self.profiles);
+        self.profiles.push(Profile {
+            name: name.clone(),
             bindings: self.bindings.clone(),
+        });
+        let index = self.profiles.len() - 1;
+        self.set_profile(index);
+        self.renaming = Some(RenameState {
+            index,
+            text: name.clone(),
+            focus: true,
+        });
+        self.persist_profiles(format!("Created \"{name}\" - type a name and press Enter"));
+    }
+
+    fn commit_rename(&mut self) {
+        let Some(state) = self.renaming.as_ref() else {
+            return;
         };
-        self.profiles.push(profile);
-        self.set_profile(self.profiles.len() - 1);
-        self.save_profiles();
+        let index = state.index;
+        let name = state.text.trim().to_owned();
+        if name.is_empty() {
+            self.notice = "A profile name cannot be empty".into();
+            return;
+        }
+        let lowered = name.to_lowercase();
+        if self
+            .profiles
+            .iter()
+            .enumerate()
+            .any(|(other, profile)| other != index && profile.name.to_lowercase() == lowered)
+        {
+            self.notice = format!("A profile named \"{name}\" already exists");
+            return;
+        }
+        if let Some(profile) = self.profiles.get_mut(index) {
+            profile.name = name.clone();
+        }
+        self.renaming = None;
+        self.persist_profiles(format!("Renamed profile to \"{name}\""));
+    }
+
+    fn delete_profile(&mut self, index: usize) {
+        self.confirm_delete = None;
+        if self.profiles.len() <= 1 || index >= self.profiles.len() {
+            self.notice = "Keep at least one profile".into();
+            return;
+        }
+        let removed = self.profiles.remove(index);
+        self.renaming = None;
+        let next = selection_after_delete(self.selected_profile, index, self.profiles.len());
+        if index == self.selected_profile {
+            self.set_profile(next);
+        } else {
+            self.selected_profile = next;
+        }
+        self.persist_profiles(format!("Deleted profile \"{}\"", removed.name));
     }
 
     fn draw_sidebar(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("navigation")
-            .exact_width(228.0)
+            .exact_width(236.0)
             .frame(
                 egui::Frame::new()
                     .fill(NAVY)
@@ -162,33 +330,41 @@ impl ControllerApp {
                 ui.vertical(|ui| {
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new("D")
-                                .size(17.0)
-                                .strong()
-                                .color(Color32::WHITE),
+                        let (rect, _) = ui.allocate_exact_size(Vec2::splat(38.0), Sense::hover());
+                        ui.painter()
+                            .rect_filled(rect, egui::CornerRadius::same(12), BLUE);
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "D",
+                            egui::FontId::proportional(20.0),
+                            Color32::WHITE,
                         );
-                        ui.label(
-                            egui::RichText::new("DUALLINK")
-                                .size(17.0)
-                                .strong()
-                                .color(Color32::WHITE),
-                        );
+                        ui.add_space(4.0);
+                        ui.vertical(|ui| {
+                            ui.add_space(1.0);
+                            ui.label(
+                                egui::RichText::new("DualLink")
+                                    .size(18.0)
+                                    .strong()
+                                    .color(Color32::WHITE),
+                            );
+                            ui.label(
+                                egui::RichText::new("CONTROLLER STUDIO")
+                                    .size(8.5)
+                                    .strong()
+                                    .color(SIDEBAR_MUTED),
+                            );
+                        });
                     });
-                    ui.label(
-                        egui::RichText::new("CONTROLLER STUDIO")
-                            .size(9.0)
-                            .strong()
-                            .color(Color32::from_rgb(143, 162, 193)),
-                    );
-                    ui.add_space(36.0);
+                    ui.add_space(32.0);
                     ui.label(
                         egui::RichText::new("WORKSPACE")
                             .size(10.0)
                             .strong()
-                            .color(Color32::from_rgb(143, 162, 193)),
+                            .color(SIDEBAR_MUTED),
                     );
-                    ui.add_space(10.0);
+                    ui.add_space(8.0);
                     for (label, marker) in [
                         ("Overview", "◈"),
                         ("Button mapping", "⌘"),
@@ -198,75 +374,76 @@ impl ControllerApp {
                         ("How to use", "?"),
                     ] {
                         let selected = self.page == label;
-                        let text = egui::RichText::new(format!("{marker}   {label}"))
-                            .size(13.0)
-                            .color(if selected {
-                                Color32::WHITE
-                            } else {
-                                Color32::from_rgb(180, 193, 214)
-                            });
-                        let button = egui::Button::new(text)
-                            .fill(if selected {
-                                Color32::from_rgb(48, 66, 99)
-                            } else {
-                                Color32::TRANSPARENT
-                            })
-                            .stroke(Stroke::NONE)
-                            .corner_radius(egui::CornerRadius::same(9));
-                        if ui.add_sized([188.0, 42.0], button).clicked() {
+                        if nav_item(ui, marker, label, selected).clicked() {
                             self.page = label.into();
                         }
+                        ui.add_space(2.0);
                     }
-                    ui.add_space(25.0);
-                    ui.separator();
-                    ui.add_space(15.0);
+                    ui.add_space(22.0);
                     ui.label(
                         egui::RichText::new("YOUR DEVICE")
                             .size(10.0)
                             .strong()
-                            .color(Color32::from_rgb(143, 162, 193)),
+                            .color(SIDEBAR_MUTED),
                     );
-                    ui.add_space(12.0);
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("●").color(
-                            if self.selected_gamepad.is_some() {
-                                GREEN
-                            } else {
-                                MUTED
-                            },
-                        ));
-                        let name = self
-                            .selected_gamepad
-                            .and_then(|selected| {
-                                self.connected_gamepads
-                                    .iter()
-                                    .find(|(id, _)| *id == selected)
-                                    .map(|(_, name)| name.as_str())
-                            })
-                            .unwrap_or("No controller");
-                        ui.label(egui::RichText::new(name).size(12.0).color(Color32::WHITE));
-                    });
-                    ui.label(
-                        egui::RichText::new(if self.virtual_gamepad.is_some() {
-                            "Xbox output enabled"
-                        } else {
-                            "Virtual Xbox output off"
+                    ui.add_space(8.0);
+                    let connected = self.selected_gamepad.is_some();
+                    let output_on = self.virtual_gamepad.is_some();
+                    let name = self
+                        .selected_gamepad
+                        .and_then(|selected| {
+                            self.connected_gamepads
+                                .iter()
+                                .find(|(id, _)| *id == selected)
+                                .map(|(_, name)| name.as_str())
                         })
-                        .size(10.0)
-                        .color(Color32::from_rgb(143, 162, 193)),
-                    );
+                        .unwrap_or("No controller");
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(30, 44, 70))
+                        .corner_radius(egui::CornerRadius::same(12))
+                        .inner_margin(egui::Margin::same(12))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("●")
+                                        .size(11.0)
+                                        .color(if connected { GREEN } else { SIDEBAR_MUTED }),
+                                );
+                                ui.label(
+                                    egui::RichText::new(name)
+                                        .size(12.0)
+                                        .strong()
+                                        .color(Color32::WHITE),
+                                );
+                            });
+                            ui.add_space(2.0);
+                            ui.label(
+                                egui::RichText::new(if output_on {
+                                    "Xbox output is on"
+                                } else {
+                                    "Xbox output is off"
+                                })
+                                .size(10.5)
+                                .color(if output_on {
+                                    Color32::from_rgb(110, 214, 168)
+                                } else {
+                                    SIDEBAR_MUTED
+                                }),
+                            );
+                        });
                     ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                         ui.add_space(10.0);
                         ui.label(
                             egui::RichText::new("A calm space to tune your\ncontroller layout.")
                                 .size(11.0)
-                                .color(Color32::from_rgb(143, 162, 193)),
+                                .color(SIDEBAR_MUTED),
                         );
                         ui.label(
                             egui::RichText::new("DUALLINK  ·  PERSONAL")
                                 .size(9.0)
                                 .strong()
-                                .color(Color32::from_rgb(143, 162, 193)),
+                                .color(SIDEBAR_MUTED),
                         );
                     });
                 });
@@ -289,27 +466,82 @@ impl ControllerApp {
                 );
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let save = egui::Button::new(
-                    egui::RichText::new("Save profile")
-                        .strong()
-                        .color(Color32::WHITE),
-                )
-                .fill(BLUE)
-                .corner_radius(egui::CornerRadius::same(9))
-                .min_size(Vec2::new(120.0, 38.0));
-                if ui.add(save).clicked() {
+                if ui.add(primary_button("Save profile", 120.0)).clicked() {
                     self.save_profiles();
                 }
                 ui.add_space(12.0);
-                ui.label(
-                    egui::RichText::new("DUALSHOCK  →  XINPUT")
-                        .size(10.0)
-                        .strong()
-                        .color(BLUE),
-                );
-                ui.add_space(6.0);
+                self.output_switch(ui);
             });
         });
+    }
+
+    /// The always-visible Xbox output switch shown at the top of every page.
+    fn output_switch(&mut self, ui: &mut egui::Ui) {
+        let on = self.virtual_gamepad.is_some();
+        let connected = self.selected_gamepad.is_some();
+        let failed = self.output_error.is_some() && !on;
+        let (dot, status) = if on {
+            (GREEN, "On - games see an Xbox controller")
+        } else if failed {
+            (RED, "Could not start - driver needed")
+        } else if connected {
+            (MUTED, "Off - switch on to use in games")
+        } else {
+            (MUTED, "Connect your controller")
+        };
+        let mut toggle = false;
+        egui::Frame::new()
+            .fill(Color32::WHITE)
+            .stroke(Stroke::new(
+                1.0_f32,
+                if on { Color32::from_rgb(168, 224, 199) } else { LINE },
+            ))
+            .corner_radius(egui::CornerRadius::same(14))
+            .inner_margin(egui::Margin {
+                left: 14,
+                right: 12,
+                top: 8,
+                bottom: 8,
+            })
+            .shadow(soft_shadow())
+            .show(ui, |ui| {
+                ui.set_width(300.0);
+                // Explicit direction: `horizontal` would flip inside the header's right-to-left row.
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new("Xbox output")
+                                .size(12.5)
+                                .strong()
+                                .color(INK),
+                        );
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 5.0;
+                            ui.label(egui::RichText::new("●").size(9.0).color(dot));
+                            ui.label(egui::RichText::new(status).size(10.5).color(MUTED));
+                            if failed {
+                                ui.hyperlink_to(
+                                    egui::RichText::new("Get ViGEmBus").size(10.5),
+                                    DRIVER_URL,
+                                );
+                            }
+                        });
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let usable = on || connected;
+                        if ui
+                            .add_enabled_ui(usable, |ui| toggle_switch(ui, on))
+                            .inner
+                            .clicked()
+                        {
+                            toggle = true;
+                        }
+                    });
+                });
+            });
+        if toggle {
+            self.set_output(!on);
+        }
     }
 
     fn draw_overview(&mut self, ui: &mut egui::Ui) {
@@ -341,6 +573,8 @@ impl ControllerApp {
                 },
                 if self.virtual_gamepad.is_some() {
                     "Xbox output is active"
+                } else if self.selected_gamepad.is_some() {
+                    "Xbox output is off"
                 } else {
                     "Connect a controller"
                 },
@@ -385,49 +619,95 @@ impl ControllerApp {
         self.notice_line(ui);
     }
 
-    fn device_card(&self, ui: &mut egui::Ui) {
+    fn device_card(&mut self, ui: &mut egui::Ui) {
+        let on = self.virtual_gamepad.is_some();
+        let connected = self.selected_gamepad.is_some();
+        let (title, detail) = if on {
+            (
+                "Xbox output is on",
+                "Games now see an Xbox 360 controller. Keep DualLink open while you play.",
+            )
+        } else if connected {
+            (
+                "Controller ready",
+                "Turn on Xbox output so games that expect an Xbox controller can use it.",
+            )
+        } else {
+            (
+                "Connect your PS4 controller",
+                "Plug it in with USB or pair it over Bluetooth. Xbox output can turn on by itself.",
+            )
+        };
+        let mut toggle = false;
         card(ui, |ui| {
             ui.horizontal(|ui| {
                 let (rect, _) = ui.allocate_exact_size(Vec2::splat(52.0), Sense::hover());
-                ui.painter()
-                    .circle_filled(rect.center(), 26.0, Color32::from_rgb(237, 241, 255));
-                ui.painter().text(
+                ui.painter().circle_filled(
                     rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "⌁",
-                    egui::FontId::proportional(27.0),
-                    BLUE,
+                    26.0,
+                    if on {
+                        Color32::from_rgb(222, 245, 235)
+                    } else {
+                        Color32::from_rgb(237, 241, 255)
+                    },
                 );
-                ui.add_space(5.0);
-                ui.vertical(|ui| {
-                    ui.label(
-                        egui::RichText::new("Controller compatibility")
-                            .size(16.0)
-                            .strong()
-                            .color(INK),
-                    );
-                    ui.label(
-                        egui::RichText::new(
-                            "Translate your controller for games that expect Xbox input.",
-                        )
-                        .size(12.0)
-                        .color(MUTED),
-                    );
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    pill(
-                        ui,
-                        if self.virtual_gamepad.is_some() {
-                            "XBOX OUTPUT ACTIVE"
-                        } else {
-                            "XBOX OUTPUT OFF"
-                        },
-                        Color32::from_rgb(237, 241, 255),
+                if on {
+                    let c = rect.center();
+                    ui.painter().add(egui::Shape::line(
+                        vec![
+                            c + Vec2::new(-9.0, 0.5),
+                            c + Vec2::new(-3.0, 7.0),
+                            c + Vec2::new(9.5, -7.0),
+                        ],
+                        Stroke::new(3.0_f32, GREEN),
+                    ));
+                } else {
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "⌁",
+                        egui::FontId::proportional(27.0),
                         BLUE,
                     );
+                }
+                ui.add_space(5.0);
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new(title).size(17.0).strong().color(INK));
+                    ui.label(egui::RichText::new(detail).size(12.0).color(MUTED));
+                    if let (Some(error), false) = (&self.output_error, on) {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 5.0;
+                            ui.label(
+                                egui::RichText::new("Could not start Xbox output.")
+                                    .size(11.5)
+                                    .color(RED),
+                            );
+                            ui.hyperlink_to(
+                                egui::RichText::new("Install the ViGEmBus driver").size(11.5),
+                                DRIVER_URL,
+                            );
+                        });
+                        ui.label(egui::RichText::new(error).size(10.0).color(MUTED));
+                    }
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if on {
+                        if ui.add(secondary_button("Turn off", 120.0)).clicked() {
+                            toggle = true;
+                        }
+                    } else if ui
+                        .add_enabled(connected, primary_button("Turn on Xbox output", 190.0))
+                        .on_disabled_hover_text("Connect a controller first")
+                        .clicked()
+                    {
+                        toggle = true;
+                    }
                 });
             });
         });
+        if toggle {
+            self.set_output(!on);
+        }
     }
 
     fn draw_mapping(&mut self, ui: &mut egui::Ui) {
@@ -545,18 +825,24 @@ impl ControllerApp {
         ui.columns(2, |columns| {
             card(&mut columns[0], |ui| {
                 ui.horizontal(|ui| {
-                    section_heading(ui, "Your profiles", "Choose a layout or make a new one");
+                    section_heading(ui, "Your profiles", "Choose, rename or remove layouts");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("+ New profile").clicked() {
+                        if ui.add(secondary_button("+ New profile", 120.0)).clicked() {
                             self.add_profile();
                         }
                     });
                 });
                 ui.add_space(14.0);
-                let mut delete_profile = None;
+                let mut action: Option<ProfileAction> = None;
+                let can_delete = self.profiles.len() > 1;
                 for index in 0..self.profiles.len() {
                     let name = self.profiles[index].name.clone();
                     let selected = self.selected_profile == index;
+                    let editing = self
+                        .renaming
+                        .as_ref()
+                        .is_some_and(|state| state.index == index);
+                    let confirming = self.confirm_delete == Some(index);
                     let frame = egui::Frame::new()
                         .fill(if selected {
                             Color32::from_rgb(240, 244, 255)
@@ -571,31 +857,112 @@ impl ControllerApp {
                                 LINE
                             },
                         ))
-                        .corner_radius(egui::CornerRadius::same(11))
+                        .corner_radius(egui::CornerRadius::same(12))
                         .inner_margin(egui::Margin::same(12));
                     frame.show(ui, |ui| {
+                        ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
                             ui.vertical(|ui| {
-                                ui.label(egui::RichText::new(&name).size(14.0).strong().color(INK));
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{} button bindings",
-                                        self.profiles[index].bindings.len()
-                                    ))
-                                    .size(11.0)
-                                    .color(MUTED),
-                                );
+                                if editing {
+                                    if let Some(state) = self.renaming.as_mut() {
+                                        let response = ui.add(
+                                            egui::TextEdit::singleline(&mut state.text)
+                                                .desired_width(190.0)
+                                                .char_limit(32),
+                                        );
+                                        if state.focus {
+                                            response.request_focus();
+                                            state.focus = false;
+                                        }
+                                        let enter =
+                                            ui.input(|input| input.key_pressed(egui::Key::Enter));
+                                        let escape =
+                                            ui.input(|input| input.key_pressed(egui::Key::Escape));
+                                        if response.lost_focus() && enter {
+                                            action = Some(ProfileAction::CommitRename);
+                                        } else if escape {
+                                            action = Some(ProfileAction::CancelRename);
+                                        }
+                                    }
+                                    ui.label(
+                                        egui::RichText::new("Enter to save, Esc to cancel")
+                                            .size(11.0)
+                                            .color(MUTED),
+                                    );
+                                } else {
+                                    let title = ui
+                                        .add(
+                                            egui::Label::new(
+                                                egui::RichText::new(&name)
+                                                    .size(14.0)
+                                                    .strong()
+                                                    .color(INK),
+                                            )
+                                            .sense(Sense::click()),
+                                        )
+                                        .on_hover_text("Double-click to rename");
+                                    if title.double_clicked() {
+                                        action = Some(ProfileAction::StartRename(index));
+                                    }
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{} button bindings",
+                                            self.profiles[index].bindings.len()
+                                        ))
+                                        .size(11.0)
+                                        .color(MUTED),
+                                    );
+                                }
                             });
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if selected {
-                                        pill(ui, "CURRENT", Color32::from_rgb(226, 234, 255), BLUE);
-                                    } else if ui.button("Use profile").clicked() {
-                                        self.set_profile(index);
-                                    }
-                                    if self.profiles.len() > 1 && ui.small_button("Delete").clicked() {
-                                        delete_profile = Some(index);
+                                    if editing {
+                                        if ui.button("Cancel").clicked() {
+                                            action = Some(ProfileAction::CancelRename);
+                                        }
+                                        if ui.add(primary_button("Save", 70.0)).clicked() {
+                                            action = Some(ProfileAction::CommitRename);
+                                        }
+                                    } else if confirming {
+                                        let delete = egui::Button::new(
+                                            egui::RichText::new("Delete")
+                                                .strong()
+                                                .color(Color32::WHITE),
+                                        )
+                                        .fill(RED);
+                                        if ui.add(delete).clicked() {
+                                            action = Some(ProfileAction::ConfirmDelete(index));
+                                        }
+                                        if ui.button("Keep").clicked() {
+                                            action = Some(ProfileAction::CancelDelete);
+                                        }
+                                        ui.label(
+                                            egui::RichText::new("Delete this profile?")
+                                                .size(11.5)
+                                                .color(RED),
+                                        );
+                                    } else {
+                                        if ui
+                                            .add_enabled(can_delete, egui::Button::new("Delete"))
+                                            .on_disabled_hover_text("Keep at least one profile")
+                                            .clicked()
+                                        {
+                                            action = Some(ProfileAction::AskDelete(index));
+                                        }
+                                        if ui.button("Rename").clicked() {
+                                            action = Some(ProfileAction::StartRename(index));
+                                        }
+                                        if selected {
+                                            pill(
+                                                ui,
+                                                "CURRENT",
+                                                Color32::from_rgb(226, 234, 255),
+                                                BLUE,
+                                            );
+                                        } else if ui.button("Use profile").clicked() {
+                                            action = Some(ProfileAction::Use(index));
+                                        }
                                     }
                                 },
                             );
@@ -603,42 +970,71 @@ impl ControllerApp {
                     });
                     ui.add_space(8.0);
                 }
-                if let Some(index) = delete_profile {
-                    self.profiles.remove(index);
-                    if self.selected_profile > index {
-                        self.selected_profile -= 1;
-                    } else if self.selected_profile == index {
-                        self.selected_profile = index.min(self.profiles.len() - 1);
+                match action {
+                    Some(ProfileAction::Use(index)) => self.set_profile(index),
+                    Some(ProfileAction::StartRename(index)) => {
+                        self.confirm_delete = None;
+                        if let Some(profile) = self.profiles.get(index) {
+                            self.renaming = Some(RenameState {
+                                index,
+                                text: profile.name.clone(),
+                                focus: true,
+                            });
+                        }
                     }
-                    self.bindings = self.profiles[self.selected_profile].bindings.clone();
-                    self.save_profiles();
-                    self.notice = "Profile deleted".into();
+                    Some(ProfileAction::CommitRename) => self.commit_rename(),
+                    Some(ProfileAction::CancelRename) => self.renaming = None,
+                    Some(ProfileAction::AskDelete(index)) => {
+                        self.renaming = None;
+                        self.confirm_delete = Some(index);
+                    }
+                    Some(ProfileAction::ConfirmDelete(index)) => self.delete_profile(index),
+                    Some(ProfileAction::CancelDelete) => self.confirm_delete = None,
+                    None => {}
                 }
-                ui.add_space(8.0);
+                ui.add_space(4.0);
                 ui.label(
-                    egui::RichText::new("Profiles are saved locally on this computer.")
-                        .size(11.0)
-                        .color(MUTED),
+                    egui::RichText::new(
+                        "Renaming and deleting save right away. Use Save profile to keep button changes.",
+                    )
+                    .size(11.0)
+                    .color(MUTED),
                 );
             });
             card(&mut columns[1], |ui| {
                 section_heading(ui, "Selected layout", "Edit bindings in Button mapping");
                 ui.add_space(14.0);
                 let selected_index = self.selected_profile;
-                ui.label(egui::RichText::new("Profile name").size(11.0).strong().color(MUTED));
-                ui.add(egui::TextEdit::singleline(&mut self.profiles[selected_index].name)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("Enter a profile name"));
-                ui.add_space(5.0);
-                if ui.button("Save profile name").clicked() {
-                    let cleaned = self.profiles[selected_index].name.trim().to_owned();
-                    if cleaned.is_empty() {
-                        self.profiles[selected_index].name = "My profile".into();
-                    } else {
-                        self.profiles[selected_index].name = cleaned;
-                    }
-                    self.save_profiles();
-                    self.notice = "Profile name saved".into();
+                let selected_name = self.profile_name().to_owned();
+                let mut rename = false;
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new("PROFILE NAME")
+                                .size(9.5)
+                                .strong()
+                                .color(MUTED),
+                        );
+                        ui.label(
+                            egui::RichText::new(&selected_name)
+                                .size(19.0)
+                                .strong()
+                                .color(INK),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Rename").clicked() {
+                            rename = true;
+                        }
+                    });
+                });
+                if rename {
+                    self.confirm_delete = None;
+                    self.renaming = Some(RenameState {
+                        index: selected_index,
+                        text: selected_name,
+                        focus: true,
+                    });
                 }
                 ui.add_space(5.0);
                 ui.label(
@@ -784,6 +1180,37 @@ impl ControllerApp {
         }
     }
 
+    /// Turns Xbox output on or off from any page (header switch, Overview, Compatibility).
+    fn set_output(&mut self, on: bool) {
+        if on {
+            self.user_turned_off = false;
+            self.enable_virtual_gamepad();
+        } else {
+            self.user_turned_off = true;
+            self.disable_virtual_gamepad();
+        }
+    }
+
+    /// Starts Xbox output by itself when a controller connects, if that setting is on.
+    /// It tries once per connection, so a missing driver does not cause a retry every frame.
+    fn maybe_auto_enable(&mut self) {
+        if self.selected_gamepad.is_none() {
+            self.auto_attempted = false;
+            self.user_turned_off = false;
+            return;
+        }
+        if should_auto_enable(
+            self.auto_enable,
+            true,
+            self.auto_attempted,
+            self.user_turned_off,
+            self.virtual_gamepad.is_some(),
+        ) {
+            self.auto_attempted = true;
+            self.enable_virtual_gamepad();
+        }
+    }
+
     fn enable_virtual_gamepad(&mut self) {
         if self.selected_gamepad.is_none() {
             self.notice = "Connect a controller before enabling game output".into();
@@ -799,11 +1226,13 @@ impl ControllerApp {
         match result {
             Ok(target) => {
                 self.virtual_gamepad = Some(target);
+                self.output_error = None;
                 self.notice = "Virtual Xbox controller is ready for games".into();
             }
             Err(error) => {
                 self.notice = format!("Could not start Xbox output. Install the signed ViGEmBus driver, then try again. Details: {error}");
                 eprintln!("Could not start virtual Xbox controller: {error}");
+                self.output_error = Some(error);
             }
         }
     }
@@ -875,8 +1304,8 @@ impl ControllerApp {
                 ui.add_space(14.0);
                 for (number, instruction) in [
                     "Connect the DualShock 4 by USB or Bluetooth.",
-                    "Select it below and enable Xbox output.",
-                    "Leave this app open, then start your game.",
+                    "Xbox output turns on by itself, or use the switch at the top.",
+                    "Leave DualLink open, then start your game.",
                 ].iter().enumerate() {
                     ui.horizontal(|ui| {
                         pill(ui, &format!("{}", number + 1), Color32::from_rgb(237, 241, 255), BLUE);
@@ -899,12 +1328,22 @@ impl ControllerApp {
                         }
                     });
                 ui.add_space(14.0);
-                if self.virtual_gamepad.is_some() {
-                    if ui.button("Turn off Xbox output").clicked() {
-                        self.disable_virtual_gamepad();
+                ui.horizontal(|ui| {
+                    if toggle_switch(ui, self.auto_enable).clicked() {
+                        self.auto_enable = !self.auto_enable;
+                        if let Err(error) = save_settings(&Settings { auto_enable: self.auto_enable }) {
+                            self.notice = format!("Could not save settings: {error}");
+                        }
                     }
-                } else if ui.add_enabled(self.selected_gamepad.is_some(), egui::Button::new("Enable Xbox output for games")).clicked() {
-                    self.enable_virtual_gamepad();
+                    ui.label(egui::RichText::new("Turn on Xbox output automatically when a controller connects").size(12.0).color(INK));
+                });
+                ui.add_space(10.0);
+                if self.virtual_gamepad.is_some() {
+                    if ui.add(secondary_button("Turn off Xbox output", 190.0)).clicked() {
+                        self.set_output(false);
+                    }
+                } else if ui.add_enabled(self.selected_gamepad.is_some(), primary_button("Turn on Xbox output", 190.0)).clicked() {
+                    self.set_output(true);
                 }
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
@@ -939,6 +1378,30 @@ impl ControllerApp {
         self.notice_line(ui);
     }
 
+    fn draw_ui(&mut self, ctx: &egui::Context) {
+        self.draw_sidebar(ctx);
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(BG)
+                    .inner_margin(egui::Margin::same(26)),
+            )
+            .show(ctx, |ui| {
+                self.draw_header(ui);
+                ui.add_space(18.0);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| match self.page.as_str() {
+                        "Button mapping" => self.draw_mapping(ui),
+                        "Input test" => self.draw_input_test(ui),
+                        "Profiles" => self.draw_profiles(ui),
+                        "Compatibility" => self.draw_compatibility(ui),
+                        "How to use" => self.draw_help(ui),
+                        _ => self.draw_overview(ui),
+                    });
+            });
+    }
+
     fn pad_view(&self) -> PadView {
         PadView {
             left_x: self.left_x,
@@ -969,6 +1432,7 @@ impl ControllerApp {
 impl eframe::App for ControllerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_controller();
+        self.maybe_auto_enable();
         ctx.request_repaint_after(Duration::from_millis(16));
         let captured = ctx.input(|input| {
             input.raw.events.iter().find_map(|event| match event {
@@ -1007,27 +1471,7 @@ impl eframe::App for ControllerApp {
             }
         }
 
-        self.draw_sidebar(ctx);
-        egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(BG)
-                    .inner_margin(egui::Margin::same(26)),
-            )
-            .show(ctx, |ui| {
-                self.draw_header(ui);
-                ui.add_space(18.0);
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| match self.page.as_str() {
-                        "Button mapping" => self.draw_mapping(ui),
-                        "Input test" => self.draw_input_test(ui),
-                        "Profiles" => self.draw_profiles(ui),
-                        "Compatibility" => self.draw_compatibility(ui),
-                        "How to use" => self.draw_help(ui),
-                        _ => self.draw_overview(ui),
-                    });
-            });
+        self.draw_ui(ctx);
 
         if self.screenshot_path.is_some() && !self.screenshot_requested {
             self.screenshot_frames += 1;
@@ -1367,13 +1811,142 @@ fn page_subtitle(page: &str) -> &str {
     }
 }
 
+fn soft_shadow() -> egui::Shadow {
+    egui::Shadow {
+        offset: [0, 2],
+        blur: 12,
+        spread: 0,
+        color: Color32::from_black_alpha(14),
+    }
+}
+
 fn card(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::new()
         .fill(Color32::WHITE)
         .stroke(Stroke::new(1.0_f32, LINE))
-        .corner_radius(egui::CornerRadius::same(15))
-        .inner_margin(egui::Margin::same(17))
+        .corner_radius(egui::CornerRadius::same(16))
+        .inner_margin(egui::Margin::same(18))
+        .shadow(soft_shadow())
         .show(ui, content);
+}
+
+fn primary_button(label: &str, min_width: f32) -> egui::Button<'static> {
+    egui::Button::new(
+        egui::RichText::new(label)
+            .size(13.0)
+            .strong()
+            .color(Color32::WHITE),
+    )
+    .fill(BLUE)
+    .stroke(Stroke::NONE)
+    .corner_radius(egui::CornerRadius::same(10))
+    .min_size(Vec2::new(min_width, 38.0))
+}
+
+fn secondary_button(label: &str, min_width: f32) -> egui::Button<'static> {
+    egui::Button::new(egui::RichText::new(label).size(13.0).strong().color(BLUE))
+        .fill(Color32::from_rgb(237, 241, 255))
+        .stroke(Stroke::NONE)
+        .corner_radius(egui::CornerRadius::same(10))
+        .min_size(Vec2::new(min_width, 38.0))
+}
+
+/// An on/off switch. Returns the click response; the caller decides what to do with it.
+fn toggle_switch(ui: &mut egui::Ui, on: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(46.0, 26.0), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let t = ui.ctx().animate_bool_responsive(response.id, on);
+        let enabled = ui.is_enabled();
+        let track = Color32::from_rgb(205, 212, 224).lerp_to_gamma(GREEN, t);
+        let track = if enabled { track } else { track.gamma_multiply(0.55) };
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(13), track);
+        let knob = Pos2::new(
+            egui::lerp((rect.left() + 13.0)..=(rect.right() - 13.0), t),
+            rect.center().y,
+        );
+        ui.painter()
+            .circle_filled(knob + Vec2::new(0.0, 1.0), 10.5, Color32::from_black_alpha(22));
+        ui.painter().circle_filled(knob, 10.0, Color32::WHITE);
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// One row of the sidebar navigation: painted by hand so it can show a hover and an accent bar.
+fn nav_item(ui: &mut egui::Ui, marker: &str, label: &str, selected: bool) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 42.0), Sense::click());
+    if selected || response.hovered() {
+        ui.painter().rect_filled(
+            rect,
+            egui::CornerRadius::same(10),
+            if selected {
+                Color32::from_rgb(48, 66, 99)
+            } else {
+                Color32::from_rgb(33, 47, 74)
+            },
+        );
+    }
+    if selected {
+        ui.painter().rect_filled(
+            Rect::from_min_size(rect.left_top() + Vec2::new(0.0, 11.0), Vec2::new(3.0, 20.0)),
+            egui::CornerRadius::same(2),
+            Color32::from_rgb(120, 150, 255),
+        );
+    }
+    let color = if selected {
+        Color32::WHITE
+    } else {
+        Color32::from_rgb(180, 193, 214)
+    };
+    ui.painter().text(
+        rect.left_center() + Vec2::new(18.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        marker,
+        egui::FontId::proportional(14.0),
+        color,
+    );
+    ui.painter().text(
+        rect.left_center() + Vec2::new(46.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(13.0),
+        color,
+    );
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// App-wide look: soft rounded controls, blue accents, white popups.
+fn apply_style(ctx: &egui::Context) {
+    let mut style = (*ctx.style()).clone();
+    style.spacing.item_spacing = Vec2::new(10.0, 8.0);
+    style.spacing.button_padding = Vec2::new(14.0, 7.0);
+    style.spacing.interact_size.y = 32.0;
+    let radius = egui::CornerRadius::same(9);
+    let visuals = &mut style.visuals;
+    visuals.panel_fill = BG;
+    visuals.window_fill = Color32::WHITE;
+    visuals.extreme_bg_color = Color32::WHITE;
+    visuals.faint_bg_color = Color32::from_rgb(246, 248, 252);
+    visuals.hyperlink_color = BLUE;
+    visuals.selection.bg_fill = Color32::from_rgb(214, 224, 255);
+    visuals.selection.stroke = Stroke::new(1.0_f32, BLUE);
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, LINE);
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, INK);
+    for (widget, fill, stroke_color) in [
+        (&mut visuals.widgets.inactive, Color32::from_rgb(238, 242, 250), Color32::from_rgb(222, 228, 240)),
+        (&mut visuals.widgets.hovered, Color32::from_rgb(226, 234, 252), Color32::from_rgb(170, 190, 250)),
+        (&mut visuals.widgets.active, Color32::from_rgb(210, 222, 252), BLUE),
+        (&mut visuals.widgets.open, Color32::from_rgb(226, 234, 252), Color32::from_rgb(170, 190, 250)),
+    ] {
+        widget.weak_bg_fill = fill;
+        widget.bg_fill = fill;
+        widget.bg_stroke = Stroke::new(1.0_f32, stroke_color);
+        widget.fg_stroke = Stroke::new(1.0_f32, INK);
+        widget.corner_radius = radius;
+        widget.expansion = 0.0;
+    }
+    ctx.set_style(style);
 }
 
 fn metric_card(ui: &mut egui::Ui, title: &str, value: &str, detail: &str, accent: Color32) {
@@ -2193,13 +2766,18 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "DualLink Controller Studio",
         options,
-        Box::new(move |_creation_context| Ok(Box::new(ControllerApp::new(screenshot_path)))),
+        Box::new(move |creation_context| {
+            apply_style(&creation_context.egui_ctx);
+            Ok(Box::new(ControllerApp::new(screenshot_path)))
+        }),
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ds4_touchpad_click_from_report, mapped_button, migrate_profile_bindings, translate_controls, trigger_value};
+    use super::{ds4_touchpad_click_from_report, mapped_button, migrate_profile_bindings, translate_controls, trigger_value,
+        selection_after_delete, should_auto_enable, unique_profile_name, Profile,
+    };
     use vigem_client::{XButtons, XGamepad};
 
     #[test]
@@ -2308,5 +2886,33 @@ mod tests {
     fn unmapped_controls_produce_neutral_output() {
         let state = translate_controls([true; 18], 1.0, 1.0, &vec!["Unmapped".into(); 18]);
         assert_eq!(state, XGamepad::default());
+    }
+
+    #[test]
+    fn new_profile_names_never_collide() {
+        let profile = |name: &str| Profile { name: name.into(), bindings: Vec::new() };
+        let profiles = vec![profile("Everyday"), profile("my profile 3")];
+        assert_eq!(unique_profile_name(&profiles), "My profile 4");
+        assert_eq!(unique_profile_name(&[]), "My profile 1");
+    }
+
+    #[test]
+    fn selection_follows_the_right_profile_after_a_delete() {
+        assert_eq!(selection_after_delete(2, 0, 3), 1);
+        assert_eq!(selection_after_delete(0, 2, 3), 0);
+        assert_eq!(selection_after_delete(1, 1, 3), 1);
+        assert_eq!(selection_after_delete(2, 2, 2), 1);
+    }
+
+    #[test]
+    fn xbox_output_starts_automatically_only_when_it_should() {
+        // normal case: setting on, controller connected, nothing tried yet
+        assert!(should_auto_enable(true, true, false, false, false));
+        // setting off, no controller, already tried, switched off by the user, already on
+        assert!(!should_auto_enable(false, true, false, false, false));
+        assert!(!should_auto_enable(true, false, false, false, false));
+        assert!(!should_auto_enable(true, true, true, false, false));
+        assert!(!should_auto_enable(true, true, false, true, false));
+        assert!(!should_auto_enable(true, true, false, false, true));
     }
 }
