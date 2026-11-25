@@ -162,7 +162,7 @@ pub(crate) fn draw_controller(ui: &mut egui::Ui, view: &PadView) {
     }
     mesh.indices = triangles.clone();
     painter.add(egui::Shape::mesh(mesh));
-    painter.add(egui::Shape::closed_line(screen, Stroke::new(2.0, outline)));
+    painter.add(egui::Shape::closed_line(screen, Stroke::new(2.0_f32, outline)));
 
     // Bumpers (L1/R1): strips along the shoulders.
     for (mirrored, down) in [(true, view.pressed[8]), (false, view.pressed[9])] {
@@ -281,7 +281,7 @@ pub(crate) fn draw_controller(ui: &mut egui::Ui, view: &PadView) {
             14.0 * scale,
             Stroke::new(if down { 2.5 * scale } else { 1.0 }, if down { lit } else { idle }),
         );
-        painter.circle_stroke(cap, 8.0 * scale, Stroke::new(1.0, well));
+        painter.circle_stroke(cap, 8.0 * scale, Stroke::new(1.0_f32, well));
     }
 }
 
